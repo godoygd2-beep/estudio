@@ -3,7 +3,7 @@ import { peaksOf, pitchTempo, cancelLoopback, extract, simplify, toInt16, fromIn
 import * as db from './db.js';
 import * as media from './media.js';
 
-const VERSAO = '1.0.1';
+const VERSAO = '1.0.2';
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const app = $('#app');
@@ -45,6 +45,7 @@ const I = {
 /* ---------------- ajustes do aparelho ---------------- */
 const CFG_KEY = 'estudio.cfg';
 const cfg = Object.assign({ inputId: '', inputLabel: '', lat: null, vsync: 0, cam: 'back', q: '1080', clean: true }, (() => { try { return JSON.parse(localStorage.getItem(CFG_KEY)) || {}; } catch (e) { return {}; } })());
+if (cfg.audioMode !== 2) { if (cfg.lat != null) cfg.recal = true; cfg.lat = null; cfg.audioMode = 2; if (cfg.camLat == null) cfg.camLat = 90; try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) { /* ok */ } }
 const saveCfg = () => { try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) { /* sem espaço */ } };
 
 /* ---------------- modelo ---------------- */
@@ -96,7 +97,7 @@ function unloadProject(p) { if (!p) return; p.tracks.forEach(tr => tr.takes.forE
 let ctx = null; const bus = {}; let live = [];
 function ensureCtx() {
   if (!ctx) {
-    ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+    ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'playback' });
     bus.master = ctx.createGain(); bus.master.gain.value = .85;
     const lim = ctx.createDynamicsCompressor(); lim.threshold.value = -4; lim.ratio.value = 20; lim.attack.value = .003; lim.release.value = .15;
     bus.out = ctx.createGain(); bus.master.connect(lim); lim.connect(bus.out); bus.out.connect(ctx.destination);
@@ -132,11 +133,17 @@ function getAB(take, semis, sp) {
   return e.ab;
 }
 let worker = null, wid = 0; const wjobs = new Map();
+let workerBroken = false;
 function runJob(msg, fallback) {
+  if (workerBroken) return Promise.resolve().then(fallback);
   try {
-    if (!worker) { worker = new Worker(new URL('./dsp-worker.js', import.meta.url), { type: 'module' }); worker.onmessage = e => { const j = wjobs.get(e.data.id); if (!j) return; wjobs.delete(e.data.id); if (e.data.error) j.rej(new Error(e.data.error)); else j.res(e.data.out); }; }
-    return new Promise((res, rej) => { const id = ++wid; wjobs.set(id, { res, rej }); worker.postMessage({ id, ...msg }); });
-  } catch (e) { return Promise.resolve(fallback()); }
+    if (!worker) {
+      worker = new Worker(new URL('./dsp-worker.js', import.meta.url), { type: 'module' });
+      worker.onmessage = e => { const j = wjobs.get(e.data.id); if (!j) return; wjobs.delete(e.data.id); if (e.data.error) j.rej(new Error(e.data.error)); else j.res(e.data.out); };
+      worker.onerror = () => { workerBroken = true; wjobs.forEach(j => j.rej(new Error('worker'))); wjobs.clear(); };
+    }
+    return new Promise((res, rej) => { const id = ++wid; wjobs.set(id, { res, rej }); worker.postMessage({ id, ...msg }); }).catch(() => fallback());
+  } catch (e) { workerBroken = true; return Promise.resolve().then(fallback); }
 }
 const runPitch = (chans, semis, speed) => runJob({ kind: 'pitch', chans, semis, speed }, () => pitchTempo(chans, semis, speed));
 const runClean = (inp, ref, M, sr) => runJob({ kind: 'clean', inp, ref, M, sr }, () => { const r = cancelLoopback(inp, ref, M, sr); return r && { chans: r.out, db: r.db, lag: r.lag }; });
@@ -181,7 +188,15 @@ function startAt(from, o = {}) {
   S.pos = from; wake(true); refreshTransport();
 }
 function stopPlay() { if (!P.playing) return; S.pos = curPos(); P.playing = false; stopSources(); wake(false); refreshTransport(); }
-async function restartIfPlaying() { if (P.playing && P.mode === 'studio' && !S.recording) { const at = curPos(); stopPlay(); await ensureProcessed(S.cur.speed); startAt(at); } }
+let restarting = false, restartAgain = false, restartAt = 0;
+async function restartIfPlaying() {
+  if (restarting) { restartAgain = true; return; }
+  if (!(P.playing && P.mode === 'studio' && !S.recording)) return;
+  restarting = true; restartAt = curPos(); stopPlay();
+  try { do { restartAgain = false; await ensureProcessed(S.cur.speed); } while (restartAgain); }
+  finally { restarting = false; }
+  if (S.screen === 'studio' && !S.recording) startAt(restartAt);
+}
 
 let wl = null;
 async function wake(on) { try { if (on && !wl && navigator.wakeLock) { wl = await navigator.wakeLock.request('screen'); wl.addEventListener('release', () => { wl = null; }); } else if (!on && wl && !S.recording) { await wl.release(); wl = null; } } catch (e) { wl = null; } }
@@ -353,6 +368,7 @@ function seek(T) { T = clamp(T, 0, S.tlLen); if (S.recording || S.counting) retu
 
 /* monitor: câmera ao vivo ou o vídeo gravado, sincronizado com a música */
 function monTrack() { const v = vids(); if (!v.length) return null; const pos = curPos(); return v.find(t => t.arm) || (S.sel && v.find(t => t.id === S.sel.t)) || v.find(t => t.clips.some(c => pos >= c.start && pos < c.start + c.dur)) || v[0]; }
+const outLat = () => ctx ? (ctx.outputLatency || ctx.baseLatency || 0) : 0;
 function videoTimeAt(take, c, t) { const u = c.offset + (t - c.start); return take.recStart + u - take.video.t0 - (take.video.sync || 0) / 1000; }
 function syncMonitor(p) {
   const mv = $('#mv'); if (!mv) return;
@@ -396,7 +412,7 @@ function frameStudio() {
   else cn.hidden = true;
   const lw = $('#lvlWrap'); if (lw) { lw.hidden = !mic; if (mic) { const l = $('#lvl'); l.style.width = Math.min(100, S.level * 100) + '%'; l.classList.toggle('hot', S.level > .97); } }
   const l2 = $('#lvl2'); if (l2) { l2.style.width = Math.min(100, S.level * 100) + '%'; l2.classList.toggle('hot', S.level > .97); }
-  syncMonitor(p);
+  syncMonitor(P.playing ? Math.max(P.from, p - outLat() * P.speed) : p);
 }
 function refreshTransport() {
   const pb = $('#playBtn'); if (pb) { const busy = (P.playing && P.mode === 'studio') || S.recording || S.counting; pb.innerHTML = S.recording || S.counting ? I.stop : busy ? I.pause : I.play; pb.setAttribute('aria-label', busy ? 'Parar' : 'Tocar'); }
@@ -460,7 +476,7 @@ async function stopRecord() {
   refChunks = [];
   const chans = simplify(raw);
   const take = makeTake(chans, sr, r.from + (f0 / sr - r.t0 - r.lat), `Tomada ${tr.takes.length + 1}`);
-  if (vblob && r.video.startCtx != null) take.video = { mime: vblob.type, t0: r.from + (r.video.startCtx - r.t0 - r.lat) + cfg.vsync / 1000, sync: 0, dur: endCtx - r.video.startCtx, bytes: Math.round(vblob.size / 1e5) / 10 };
+  if (vblob && r.video.startCtx != null) take.video = { v: 2, mime: vblob.type, t0: r.from + (r.video.startCtx - r.t0 - r.lat) - (cfg.camLat || 0) / 1000 + cfg.vsync / 1000, sync: 0, dur: endCtx - r.video.startCtx, bytes: Math.round(vblob.size / 1e5) / 10 };
   try {
     await saveTakeAudio(take);
     if (take.video) { await db.put('vid', take.id, vblob); take.vurl = URL.createObjectURL(vblob); }
@@ -550,7 +566,7 @@ const SHEETS = {
       ${rng2('rLow', 'low', 'Grave', tr.fx.low, -12, 12, 1, dbs(tr.fx.low))}${rng2('rMid', 'mid', 'Médio', tr.fx.mid, -12, 12, 1, dbs(tr.fx.mid))}${rng2('rHigh', 'high', 'Agudo', tr.fx.high, -12, 12, 1, dbs(tr.fx.high))}
       <div class="sw"><span>Compressor<small>Deixa o volume mais parelho</small></span><button class="tgl${tr.fx.comp ? ' on' : ''}" data-act="comp" aria-label="Compressor"></button></div>
       ${rng2('rRev', 'rev', 'Reverb', tr.fx.rev, 0, 100, 1, tr.fx.rev + '%')}${rng2('rDly', 'dly', 'Eco (delay)', tr.fx.dly, 0, 100, 1, tr.fx.dly + '%')}
-      <p class="note">O eco acompanha o BPM do projeto (♩ ${S.cur.bpm}).</p>`;
+      <p class="note">O eco repete as notas no ritmo do BPM do projeto (♩ ${S.cur.bpm}). Se esse BPM não for o da música, o eco sai fora do tempo. Acerte em ♩ → Toque aqui no ritmo da música.</p>`;
     else if (tab === 'tom') body = `<div class="pitch"><button class="pbtn" data-act="semi" data-v="-1" aria-label="Meio tom abaixo">−</button><div class="pval"><b>${tr.semis > 0 ? '+' : ''}${tr.semis}</b><span>semitons</span></div><button class="pbtn" data-act="semi" data-v="1" aria-label="Meio tom acima">+</button></div>
       <p class="note">Muda só esta faixa, sem mudar a velocidade. Ideal para tocar junto com um MP3 em outro tom.</p>${tr.semis ? '<button class="ghost" data-act="semi0">Voltar ao tom original</button>' : ''}`;
     else if (tab === 'takes') {
@@ -558,7 +574,7 @@ const SHEETS = {
       body = tr.takes.length ? tr.takes.map(k => `<div class="take"><div class="tinfo"><b>${esc(k.name)}</b><small>${fmt(k.dur)} · a partir de ${fmt(k.recStart)}${k.video ? ' · com vídeo' : ''}</small></div>
         <button class="ib" data-act="hearTake" data-v="${k.id}" aria-label="Ouvir">${S.hear === k.id ? I.pause : I.play}</button><button class="use${used.has(k.id) ? ' on' : ''}" data-act="useTake" data-v="${k.id}">${used.has(k.id) ? 'Em uso' : 'Usar'}</button></div>
         ${k.video && used.has(k.id) ? `<div class="ctl"><div class="ctlh"><span>Sincronia do vídeo</span><b>${(k.video.sync || 0) > 0 ? '+' : ''}${k.video.sync || 0} ms</b></div><div class="nudge">${['-50', '-10', '10', '50'].map(v => `<button data-act="vsync" data-k="${k.id}" data-v="${v}">${+v > 0 ? '+' : '−'}${Math.abs(v)} ms</button>`).join('')}</div>
-        <p class="note" style="margin-top:6px">Se a mão aparece antes do som, toque em +. Se aparece depois, em −.</p></div>` : ''}`).join('')
+        <p class="note" style="margin-top:6px">Toque no vídeo para aumentar e confira. Se a mão aparece antes do som, toque em +. Se aparece depois, em −. O valor fica guardado para as próximas gravações.</p></div>` : ''}`).join('')
         + `<p class="note">Gravar de novo nesta faixa cria outra tomada. As anteriores ficam aqui para você escolher a melhor.</p>${tr.takes.some(k => !used.has(k.id)) ? '<button class="ghost" data-act="purge">Apagar tomadas que não estão em uso</button>' : ''}`
         : '<p class="note">Ainda não há tomadas. Toque no R desta faixa e depois em ● para gravar.</p>';
     }
@@ -578,12 +594,13 @@ const SHEETS = {
   },
   settings() {
     const list = S.inputs, curId = (mic && mic.settings.deviceId) || cfg.inputId;
-    const info = mic ? `${ctx.sampleRate} Hz · ${mic.settings.channelCount || '?'} canal(is)` : 'Entrada fechada';
+    const info = mic ? `Saída ${ctx.sampleRate} Hz, entrada ${mic.settings.sampleRate || '?'} Hz, ${mic.settings.channelCount || '?'} canal(is), atraso de saída ${Math.round(outLat() * 1000)} ms` : 'Entrada fechada';
     return { title: 'Ajustes', body: `<div><span class="lab">Entrada da guitarra</span>
       ${list.length ? `<select class="sel" id="inSel" data-ch="inSel">${list.map(d => `<option value="${esc(d.deviceId)}"${d.deviceId === curId ? ' selected' : ''}>${esc(d.label || 'Entrada sem nome')}</option>`).join('')}</select>` : '<p class="note">Ligue o Cuvave na USB e permita o uso do áudio.</p>'}
       <div class="lvl" style="height:10px"><i id="lvl2"></i></div><p class="note" style="margin-top:6px">Toque a guitarra: a barra deve mexer. Se ficar vermelha, baixe o volume no Cuvave. ${info}.</p></div>
       <div class="sw"><span>Tirar o som das outras faixas<small>Alguns aparelhos USB devolvem para a gravação o que o celular está tocando. O app tira esse som e deixa só a guitarra.</small></span><button class="tgl${cfg.clean ? ' on' : ''}" data-act="cleanTog" aria-label="Tirar o som das outras faixas"></button></div>
       <div><span class="lab">Atraso da gravação</span><div class="stepper"><button data-act="lat" data-v="-5" aria-label="Menos 5 ms">−5</button><b>${latMs()} ms${cfg.lat == null ? ' (estimado)' : ''}</b><button data-act="lat" data-v="5" aria-label="Mais 5 ms">+5</button></div>
+      ${cfg.lat == null ? '<p class="note" style="margin-top:8px;color:var(--accent)">Ainda não calibrado nesta versão. Calibre para a guitarra cair no tempo certo.</p>' : ''}
       <button class="btn-acc big" style="margin-top:10px" data-act="calib">Calibrar: tocar junto com 8 cliques</button>
       <p class="note" style="margin-top:8px">Com o fone no Cuvave, toque uma nota abafada junto com cada clique. O app mede o atraso e corrige as gravações.</p></div>
       <div><span class="lab">Câmera</span><div class="seg"><button class="${cfg.cam === 'back' ? 'on' : ''}" data-act="cfg" data-k="cam" data-v="back">Traseira</button><button class="${cfg.cam === 'front' ? 'on' : ''}" data-act="cfg" data-k="cam" data-v="front">Frontal</button></div></div>
@@ -709,7 +726,7 @@ const ACT = {
     else tr.clips.forEach(c => { const o = takeOf(tr, c.take); c.offset = clamp(c.offset + o.recStart - nt.recStart, 0, Math.max(0, nt.dur - .1)); c.dur = Math.max(.1, Math.min(c.dur, nt.dur - c.offset)); c.take = nt.id; });
     renderSheet(); renderStudio(); restartIfPlaying(); toast(`${nt.name} em uso.`);
   },
-  vsync(b) { const tr = trackById(S.sheet.t), k = takeOf(tr, +b.dataset.k); k.video.sync = (k.video.sync || 0) + (+b.dataset.v); renderSheet(); frameStudio(true); dirty(); },
+  vsync(b) { const tr = trackById(S.sheet.t), k = takeOf(tr, +b.dataset.k); k.video.sync = (k.video.sync || 0) + (+b.dataset.v); cfg.vsync = k.video.sync; saveCfg(); renderSheet(); frameStudio(true); dirty(); },
   vsdef(b) { cfg.vsync += +b.dataset.v; saveCfg(); renderSheet(); },
   async purge() {
     const tr = trackById(S.sheet.t); const used = new Set(tr.clips.map(c => c.take)); const gone = tr.takes.filter(k => !used.has(k.id));
@@ -815,7 +832,9 @@ if ('serviceWorker' in navigator) {
 
 (async function boot() {
   try { S.projects = (await db.all('proj')) || []; } catch (e) { S.projects = []; toast('Este navegador não deixa guardar projetos. Abra no Chrome.', 6000); }
+  S.projects.forEach(p => { p.tracks.forEach(t => t.takes.forEach(k => { if (k.video && !k.video.v) { k.video.t0 -= (cfg.camLat || 90) / 1000; k.video.v = 2; saveProject(p); } })); });
   S.projects.forEach(p => { p.loaded = false; p.undo = []; p.tracks.forEach(t => t.takes.forEach(k => { if (k.id > uid) uid = k.id; })); if (p.id > uid) uid = p.id; p.tracks.forEach(t => { if (t.id > uid) uid = t.id; t.clips.forEach(c => { if (c.id > uid) uid = c.id; }); }); });
   history.replaceState({ base: 1 }, '');
   render(); requestAnimationFrame(tick);
+  if (cfg.recal) { delete cfg.recal; saveCfg(); setTimeout(() => toast('O app mudou o jeito de tocar o som para não falhar. Calibre o atraso de novo em Ajustes antes de gravar.', 7000), 600); }
 })();

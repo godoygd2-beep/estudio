@@ -1,9 +1,9 @@
 // Estúdio de Bolso — gravação em faixas no celular.
-import { peaksOf, pitchTempo, extract, simplify, toInt16, fromInt16, median, onsetOffsets } from './dsp.js';
+import { peaksOf, pitchTempo, cancelLoopback, extract, simplify, toInt16, fromInt16, median, onsetOffsets } from './dsp.js';
 import * as db from './db.js';
 import * as media from './media.js';
 
-const VERSAO = '1.0.0';
+const VERSAO = '1.0.1';
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const app = $('#app');
@@ -44,7 +44,7 @@ const I = {
 
 /* ---------------- ajustes do aparelho ---------------- */
 const CFG_KEY = 'estudio.cfg';
-const cfg = Object.assign({ inputId: '', inputLabel: '', lat: null, vsync: 0, cam: 'back', q: '1080' }, (() => { try { return JSON.parse(localStorage.getItem(CFG_KEY)) || {}; } catch (e) { return {}; } })());
+const cfg = Object.assign({ inputId: '', inputLabel: '', lat: null, vsync: 0, cam: 'back', q: '1080', clean: true }, (() => { try { return JSON.parse(localStorage.getItem(CFG_KEY)) || {}; } catch (e) { return {}; } })());
 const saveCfg = () => { try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) { /* sem espaço */ } };
 
 /* ---------------- modelo ---------------- */
@@ -99,7 +99,7 @@ function ensureCtx() {
     ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
     bus.master = ctx.createGain(); bus.master.gain.value = .85;
     const lim = ctx.createDynamicsCompressor(); lim.threshold.value = -4; lim.ratio.value = 20; lim.attack.value = .003; lim.release.value = .15;
-    bus.master.connect(lim); lim.connect(ctx.destination);
+    bus.out = ctx.createGain(); bus.master.connect(lim); lim.connect(bus.out); bus.out.connect(ctx.destination);
     const rev = ctx.createConvolver(); const L = Math.round(2.2 * ctx.sampleRate), ir = ctx.createBuffer(2, L, ctx.sampleRate);
     for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let i = 0; i < L; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / L, 2.5); }
     rev.buffer = ir; bus.revIn = ctx.createGain(); bus.revIn.connect(rev); rev.connect(bus.master);
@@ -132,12 +132,14 @@ function getAB(take, semis, sp) {
   return e.ab;
 }
 let worker = null, wid = 0; const wjobs = new Map();
-function runPitch(chans, semis, speed) {
+function runJob(msg, fallback) {
   try {
     if (!worker) { worker = new Worker(new URL('./dsp-worker.js', import.meta.url), { type: 'module' }); worker.onmessage = e => { const j = wjobs.get(e.data.id); if (!j) return; wjobs.delete(e.data.id); if (e.data.error) j.rej(new Error(e.data.error)); else j.res(e.data.out); }; }
-    return new Promise((res, rej) => { const id = ++wid; wjobs.set(id, { res, rej }); worker.postMessage({ id, chans, semis, speed }); });
-  } catch (e) { return Promise.resolve(pitchTempo(chans, semis, speed)); }
+    return new Promise((res, rej) => { const id = ++wid; wjobs.set(id, { res, rej }); worker.postMessage({ id, ...msg }); });
+  } catch (e) { return Promise.resolve(fallback()); }
 }
+const runPitch = (chans, semis, speed) => runJob({ kind: 'pitch', chans, semis, speed }, () => pitchTempo(chans, semis, speed));
+const runClean = (inp, ref, M, sr) => runJob({ kind: 'clean', inp, ref, M, sr }, () => { const r = cancelLoopback(inp, ref, M, sr); return r && { chans: r.out, db: r.db, lag: r.lag }; });
 async function ensureProcessed(sp, only) {
   const need = [];
   (only ? [only] : S.cur.tracks).forEach(tr => {
@@ -156,7 +158,7 @@ async function ensureProcessed(sp, only) {
 function click(time, acc) {
   const o = ctx.createOscillator(), g = ctx.createGain(); o.frequency.value = acc ? 1760 : 1100;
   g.gain.setValueAtTime(.0001, time); g.gain.exponentialRampToValueAtTime(acc ? .5 : .3, time + .002); g.gain.exponentialRampToValueAtTime(.0001, time + .05);
-  o.connect(g); g.connect(ctx.destination); o.start(time); o.stop(time + .06); live.push(o);
+  o.connect(g); g.connect(bus.out); o.start(time); o.stop(time + .06); live.push(o);
 }
 function stopSources() {
   live.forEach(s => { try { s.stop(); } catch (e) { /* parado */ } }); live = [];
@@ -185,7 +187,7 @@ let wl = null;
 async function wake(on) { try { if (on && !wl && navigator.wakeLock) { wl = await navigator.wakeLock.request('screen'); wl.addEventListener('release', () => { wl = null; }); } else if (!on && wl && !S.recording) { await wl.release(); wl = null; } } catch (e) { wl = null; } }
 
 /* ---------------- entrada e câmera ---------------- */
-let mic = null, cam = null, recChunks = [], recDone = null;
+let mic = null, cam = null, recChunks = [], recDone = null, refNode = null, refChunks = [], refDone = null;
 function onRecMsg(e) { const m = e.data; if (m.lv != null) S.level = Math.max(m.lv, S.level * .8); else if (m.f != null) recChunks.push(m); else if (m.done && recDone) { recDone(); recDone = null; } }
 async function refreshInputs() { try { S.inputs = await media.listInputs(); } catch (e) { S.inputs = []; } }
 async function ensureMic() {
@@ -195,6 +197,11 @@ async function ensureMic() {
     if (!cfg.inputId) { await refreshInputs(); const u = media.guessUsb(S.inputs); if (u) { cfg.inputId = u.deviceId; cfg.inputLabel = u.label; } }
     mic = await media.openMic(ctx, cfg.inputId);
     mic.node.port.onmessage = onRecMsg;
+    if (!refNode) {
+      refNode = new AudioWorkletNode(ctx, 'rec', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1], channelCount: 2, channelCountMode: 'explicit', channelInterpretation: 'speakers' });
+      const z = ctx.createGain(); z.gain.value = 0; bus.out.connect(refNode); refNode.connect(z); z.connect(ctx.destination);
+      refNode.port.onmessage = e => { const m = e.data; if (m.f != null) refChunks.push(m); else if (m.done && refDone) { refDone(); refDone = null; } };
+    }
     mic.track.addEventListener('ended', () => { mic = null; toast('A entrada de áudio desligou. Confira o cabo do Cuvave.'); if (S.screen === 'studio') renderStudio(); });
     await refreshInputs();
     const cur = S.inputs.find(d => d.deviceId === (mic.settings.deviceId || cfg.inputId));
@@ -229,7 +236,7 @@ function render() { if (S.screen === 'projects') renderProjects(); else renderSt
 function renderProjects() {
   const list = [...S.projects].sort((a, b) => (b.updated || 0) - (a.updated || 0));
   const total = list.reduce((a, p) => a + projSize(p), 0);
-  app.innerHTML = `<header class="bar"><div class="brand"><i></i>Estúdio de Bolso</div></header>
+  app.innerHTML = `<header class="bar"><div class="brand"><i></i>Estúdio de Bolso</div>${instEvt ? '<button class="btn-acc" data-act="install">Instalar app</button>' : ''}</header>
   <main class="plist">
     ${list.length ? `<div class="sec">Projetos neste celular</div>
     ${list.map(p => { const v = p.tracks.filter(t => t.type === 'video').length; return `<div class="pc" data-act="open" data-p="${p.id}" role="button" tabindex="0"><span class="pthumb" style="background:${hexA(COLORS[p.tracks.length % COLORS.length], .15)}">${v ? I.cam : I.guitar}</span><div class="pinfo"><b>${esc(p.name)}</b><small>${p.tracks.length} faixa${p.tracks.length === 1 ? '' : 's'}${v ? ` · ${v} com vídeo` : ''} · ${fmt0(projLen(p))}</small><small class="psize">${p.date || ''} · ${projSize(p)} MB</small></div><button class="ib" data-act="projMenu" data-p="${p.id}" aria-label="Opções do projeto">${I.more}</button></div>`; }).join('')}
@@ -260,7 +267,7 @@ function renderStudio() {
   <section class="monitor"><div class="mleft"><button class="time" data-act="goto" aria-label="Ir para um tempo exato"><span id="tTime">0:00.00</span>${I.edit}</button><div class="beatl" id="tBeat"></div>
     <div class="chips"><button class="chip" data-act="tempo">${I.metro}♩ ${p.bpm} · ${metroLabel()}${p.speed < 1 ? ` · ${Math.round(p.speed * 100)}%` : ''}</button><button class="chip" data-act="settings">${I.usb}${esc(inputLabel())}</button></div>
     <div class="lvl" id="lvlWrap"${mic ? '' : ' hidden'}><i id="lvl"></i></div></div>
-    <div class="mright"><div class="mv"><video id="mv" muted playsinline></video><span class="mvnone" id="mvNone">sem vídeo</span><span class="mvtag" id="mvTag" hidden></span></div><div class="mlab" id="monLab"></div></div></section>
+    <div class="mright"><div class="mv${S.big ? ' big' : ''}" data-act="bigView" role="button" tabindex="0" aria-label="Aumentar o vídeo"><video id="mv" muted playsinline></video><span class="mvhint">Toque para diminuir</span><span class="mvnone" id="mvNone">sem vídeo</span><span class="mvtag" id="mvTag" hidden></span></div><div class="mlab" id="monLab"></div></div></section>
   <div class="tlwrap"><div class="tl" id="tl"><div class="tlin" style="width:calc(var(--thw) + ${W}px)">
     <div class="row ruler"><div class="th"><button class="zb" data-act="zoom" data-v="-1" aria-label="Afastar">−</button><button class="zb" data-act="zoom" data-v="1" aria-label="Aproximar">+</button></div><canvas class="lane grab" id="ruler"></canvas></div>
     ${p.tracks.map(tr => `<div class="row" id="row-${tr.id}"><div class="th" data-act="trackSheet" data-t="${tr.id}" role="button" tabindex="0" id="th-${tr.id}">${headerInner(tr)}</div><canvas class="lane${S.sel && S.sel.t === tr.id ? ' grab' : ''}" data-t="${tr.id}"></canvas></div>`).join('')}
@@ -366,7 +373,14 @@ function syncMonitor(p) {
   none.hidden = true; mv.style.visibility = 'visible';
   if (mv.dataset.u !== take.vurl) { mv.src = take.vurl; mv.dataset.u = take.vurl; }
   if (mv.readyState < 1) return;
-  if (P.playing) { mv.playbackRate = P.speed; if (mv.paused) mv.play().catch(() => { }); if (Math.abs(mv.currentTime - vt) > .15 && !mv.seeking) mv.currentTime = vt; }
+  if (P.playing) {
+    if (mv.paused) { if (!mv.seeking) mv.currentTime = vt; mv.playbackRate = P.speed; mv.play().catch(() => { }); return; }
+    if (mv.seeking) return;
+    const diff = mv.currentTime - vt;
+    if (Math.abs(diff) > .6) { mv.currentTime = vt; mv.playbackRate = P.speed; }
+    else if (Math.abs(diff) > .03) mv.playbackRate = P.speed * clamp(1 - diff * 1.5, .75, 1.25);
+    else if (mv.playbackRate !== P.speed) mv.playbackRate = P.speed;
+  }
   else { if (!mv.paused) mv.pause(); if (Math.abs(mv.currentTime - vt) > .04 && !mv.seeking) mv.currentTime = vt; }
 }
 function frameStudio() {
@@ -402,7 +416,7 @@ async function recStart() {
   const beats = (p.metro === 'off' || (punch && pre > 0)) ? 0 : p.countBars * 4;
   const when = ctx.currentTime + .15; for (let k = 0; k < beats; k++) click(when + k * spb, k % 4 === 0);
   const t0 = when + beats * spb;
-  recChunks = []; mic.node.port.postMessage('start');
+  recChunks = []; refChunks = []; mic.node.port.postMessage('start'); refNode.port.postMessage('start');
   let video = null;
   if (arm.type === 'video' && cam) {
     const mime = media.pickVideoMime();
@@ -425,17 +439,25 @@ async function stopRecord() {
   const counting = !!S.counting; let endTl = curPos(); const endCtx = ctx.currentTime;
   stopPlay(); S.counting = null;
   const done = new Promise(res => { recDone = res; }); if (mic) mic.node.port.postMessage('stop');
+  const rdone = new Promise(res => { refDone = res; }); if (refNode) refNode.port.postMessage('stop');
   let vblob = null;
   if (r.video) { const v = r.video; const stopped = new Promise(res => { v.mr.onstop = res; }); try { v.mr.stop(); await Promise.race([stopped, sleep(3000)]); } catch (e) { /* já parado */ } if (v.chunks.length) vblob = new Blob(v.chunks, { type: v.mime || 'video/webm' }); }
-  await Promise.race([done, sleep(1500)]);
+  await Promise.race([Promise.all([done, rdone]), sleep(1500)]);
   S.recording = null; stopping = false; wake(false);
   if (r.end != null) endTl = Math.min(endTl, r.end);
   const tr = trackById(r.t);
   if (counting || endTl - r.start < (r.punch ? .03 : .3) || !tr) { recChunks = []; S.pos = r.start; renderStudio(); if (!counting) toast(r.punch ? 'Parou antes do trecho. Nada foi gravado.' : 'Gravação muito curta.'); return; }
   const sr = ctx.sampleRate;
   const f0 = Math.ceil((r.start - r.from + r.t0 + r.lat) * sr), f1 = Math.floor((endTl - r.from + r.t0 + r.lat) * sr);
-  const raw = extract(recChunks, f0, f1); recChunks = [];
-  if (!raw) { toast('Não chegou som da entrada. Confira o Cuvave.'); renderStudio(); return; }
+  let raw = extract(recChunks, f0, f1); recChunks = [];
+  if (!raw) { refChunks = []; toast('Não chegou som da entrada. Confira o Cuvave.'); renderStudio(); return; }
+  let cleaned = null;
+  if (cfg.clean && refChunks.length) {
+    const M = Math.round(.4 * sr); const ref = extract(refChunks, f0 - M, f1); refChunks = [];
+    if (ref) { toast('Limpando a gravação…', 0); try { cleaned = await runClean(raw, ref, M, sr); } catch (e) { cleaned = null; } hideToast(); }
+    if (cleaned) raw = cleaned.chans;
+  }
+  refChunks = [];
   const chans = simplify(raw);
   const take = makeTake(chans, sr, r.from + (f0 / sr - r.t0 - r.lat), `Tomada ${tr.takes.length + 1}`);
   if (vblob && r.video.startCtx != null) take.video = { mime: vblob.type, t0: r.from + (r.video.startCtx - r.t0 - r.lat) + cfg.vsync / 1000, sync: 0, dur: endCtx - r.video.startCtx, bytes: Math.round(vblob.size / 1e5) / 10 };
@@ -450,21 +472,24 @@ async function stopRecord() {
   S.pos = endTl; S.cur.updated = Date.now(); renderStudio(); saveProject(S.cur);
   let peak = 0; for (const c of chans) for (let i = 0; i < c.length; i += 4) { const v = Math.abs(c[i]); if (v > peak) peak = v; }
   if (peak < .003) toast('A tomada ficou em silêncio. Confira o volume do Cuvave e a entrada em Ajustes.', 6000);
-  else toast(r.punch ? `Trecho regravado (${take.name}). Use ↶ para desfazer.` : `${take.name} gravada${take.video ? ' com vídeo' : ''}. As anteriores ficam em Tomadas.`);
+  else toast((r.punch ? `Trecho regravado (${take.name}). Use ↶ para desfazer.` : `${take.name} gravada${take.video ? ' com vídeo' : ''}.`) + (cleaned ? ' Tirei dela o som das outras faixas que voltou pela USB.' : ''), cleaned ? 5000 : 2800);
 }
 
 /* calibração: tocar junto com 8 cliques */
 async function calibrate(btn) {
   try { await ensureMic(); } catch (e) { return; }
   stopPlay(); const sr = ctx.sampleRate, n = 8, iv = .6, start = ctx.currentTime + 1.2; const times = [];
-  recChunks = []; mic.node.port.postMessage('start');
+  recChunks = []; refChunks = []; mic.node.port.postMessage('start'); refNode.port.postMessage('start');
   for (let k = 0; k < n; k++) { const t = start + k * iv; click(t, k % 4 === 0); times.push(t); }
   btn.disabled = true;
   for (let k = 0; k < n; k++) { await sleep(Math.max(0, (times[k] - ctx.currentTime) * 1000)); btn.textContent = `Toque junto: ${k + 1} de ${n}`; }
   await sleep(700);
-  const done = new Promise(res => { recDone = res; }); mic.node.port.postMessage('stop'); await Promise.race([done, sleep(1000)]);
+  const done = new Promise(res => { recDone = res; }), rdone = new Promise(res => { refDone = res; });
+  mic.node.port.postMessage('stop'); refNode.port.postMessage('stop'); await Promise.race([Promise.all([done, rdone]), sleep(1000)]);
   const f0 = Math.floor((start - .4) * sr), f1 = Math.ceil((start + n * iv + .5) * sr);
-  const ch = extract(recChunks, f0, f1); recChunks = [];
+  let ch = extract(recChunks, f0, f1); recChunks = [];
+  const M = Math.round(.4 * sr), ref = extract(refChunks, f0 - M, f1); refChunks = [];
+  if (ch && ref) { try { const c = await runClean(ch, ref, M, sr); if (c) ch = c.chans; } catch (e) { /* usa a gravação como veio */ } }
   const offs = ch ? onsetOffsets(ch, sr, f0, times) : [];
   if (offs.length < 5) { toast('Não ouvi as notas. Toque uma nota abafada junto com cada clique e tente de novo.', 5000); renderSheet(); return; }
   const med = median(offs); const mad = median(offs.map(o => Math.abs(o - med)));
@@ -557,6 +582,7 @@ const SHEETS = {
     return { title: 'Ajustes', body: `<div><span class="lab">Entrada da guitarra</span>
       ${list.length ? `<select class="sel" id="inSel" data-ch="inSel">${list.map(d => `<option value="${esc(d.deviceId)}"${d.deviceId === curId ? ' selected' : ''}>${esc(d.label || 'Entrada sem nome')}</option>`).join('')}</select>` : '<p class="note">Ligue o Cuvave na USB e permita o uso do áudio.</p>'}
       <div class="lvl" style="height:10px"><i id="lvl2"></i></div><p class="note" style="margin-top:6px">Toque a guitarra: a barra deve mexer. Se ficar vermelha, baixe o volume no Cuvave. ${info}.</p></div>
+      <div class="sw"><span>Tirar o som das outras faixas<small>Alguns aparelhos USB devolvem para a gravação o que o celular está tocando. O app tira esse som e deixa só a guitarra.</small></span><button class="tgl${cfg.clean ? ' on' : ''}" data-act="cleanTog" aria-label="Tirar o som das outras faixas"></button></div>
       <div><span class="lab">Atraso da gravação</span><div class="stepper"><button data-act="lat" data-v="-5" aria-label="Menos 5 ms">−5</button><b>${latMs()} ms${cfg.lat == null ? ' (estimado)' : ''}</b><button data-act="lat" data-v="5" aria-label="Mais 5 ms">+5</button></div>
       <button class="btn-acc big" style="margin-top:10px" data-act="calib">Calibrar: tocar junto com 8 cliques</button>
       <p class="note" style="margin-top:8px">Com o fone no Cuvave, toque uma nota abafada junto com cada clique. O app mede o atraso e corrige as gravações.</p></div>
@@ -598,6 +624,8 @@ async function openProject(p) {
   S.cur = p; S.screen = 'studio'; S.pos = 0; S.sel = null; S.range = null; S.tlLen = 30; history.pushState({ st: 1 }, ''); render();
 }
 const ACT = {
+  bigView(b) { S.big = !S.big; b.classList.toggle('big', S.big); b.setAttribute('aria-label', S.big ? 'Diminuir o vídeo' : 'Aumentar o vídeo'); },
+  install() { if (!instEvt) return; instEvt.prompt(); instEvt.userChoice.finally(() => { instEvt = null; if (S.screen === 'projects') renderProjects(); }); },
   goto() { if (S.recording || S.counting) return; stopPlay(); frameStudio(true); openSheet('goto'); },
   nudge(b) {
     const k = b.dataset.k, v = b.dataset.v, spb = 60 / S.cur.bpm, sg = v[0] === '-' ? -1 : 1, a = v.replace('-', ''); const d = sg * (a === 'bar' ? 4 * spb : a === 'beat' ? spb : +a);
@@ -702,6 +730,7 @@ const ACT = {
     if (b.dataset.k !== 'input' && cam) { closeCamNow(); await syncArmed(); }
     renderSheet(); if (S.screen === 'studio') renderStudio();
   },
+  cleanTog(b) { cfg.clean = !cfg.clean; saveCfg(); b.classList.toggle('on', cfg.clean); },
   lat(b) { cfg.lat = latMs() + (+b.dataset.v); saveCfg(); renderSheet(); },
   calib(b) { calibrate(b); }
 };
@@ -763,6 +792,11 @@ window.addEventListener('popstate', () => {
 document.addEventListener('visibilitychange', () => { if (document.hidden) { if (S.recording || S.counting) stopRecord(); else stopPlay(); if (S.cur) saveProject(S.cur); } });
 if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) navigator.mediaDevices.addEventListener('devicechange', async () => { await refreshInputs(); if (S.sheet && S.sheet.kind === 'settings') renderSheet(); });
 let rz = 0; window.addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(() => { if (S.screen === 'studio') renderStudio(); }, 200); });
+
+/* instalar como app */
+let instEvt = null;
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); instEvt = e; if (S.screen === 'projects') renderProjects(); });
+window.addEventListener('appinstalled', () => { instEvt = null; if (S.screen === 'projects') renderProjects(); toast('App instalado. Ele fica na tela inicial com o ícone vermelho e amarelo.', 4000); });
 
 /* versão nova do app */
 function showUpdate(reg) {

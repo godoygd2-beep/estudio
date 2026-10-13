@@ -1,5 +1,5 @@
 // Guarda o app no celular para abrir sem internet. Mude VERSION a cada publicação.
-const VERSION = 'estudio-1.0.0';
+const VERSION = 'estudio-1.0.1';
 const FILES = [
   './', 'index.html', 'manifest.webmanifest',
   'src/style.css', 'src/main.js', 'src/dsp.js', 'src/db.js', 'src/media.js', 'src/rec-worklet.js', 'src/dsp-worker.js',
